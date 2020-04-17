@@ -37,8 +37,11 @@ import com.axelor.apps.crm.db.repo.EventReminderRepository;
 import com.axelor.apps.crm.db.repo.EventRepository;
 import com.axelor.apps.crm.db.repo.RecurrenceConfigurationRepository;
 import com.axelor.apps.crm.service.EventService;
+import com.axelor.apps.message.db.EmailAccount;
 import com.axelor.apps.message.db.EmailAddress;
+import com.axelor.apps.message.db.Message;
 import com.axelor.apps.message.db.repo.EmailAddressRepository;
+import com.axelor.apps.message.db.repo.MessageRepository;
 import com.axelor.apps.office365.translation.ITranslation;
 import com.axelor.auth.AuthUtils;
 import com.axelor.auth.db.User;
@@ -63,7 +66,9 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import wslite.http.HTTPClient;
 import wslite.http.HTTPMethod;
 import wslite.http.HTTPRequest;
@@ -77,8 +82,7 @@ public class Office365ServiceImpl implements Office365Service {
   private static final String CONTACT_URL = "https://graph.microsoft.com/v1.0/me/contacts";
   private static final String CALENDAR_URL = "https://graph.microsoft.com/v1.0/me/calendars";
   private static final String EVENT_URL = "https://graph.microsoft.com/v1.0/me/calendars/%s/events";
-  private static final String SCOPE =
-      "openid offline_access Contacts.ReadWrite Calendars.ReadWrite";
+  private static final String MAIL_URL = "https://graph.microsoft.com/v1.0/me/messages";
 
   @Inject private PartnerService partnerService;
 
@@ -92,6 +96,7 @@ public class Office365ServiceImpl implements Office365Service {
   @Inject private EventReminderRepository eventReminderRepo;
   @Inject private RecurrenceConfigurationRepository recurrenceConfigurationRepo;
   @Inject private UserRepository userRepo;
+  @Inject private MessageRepository messageRepo;
 
   public void syncContact(AppOffice365 appOffice365) throws AxelorException, MalformedURLException {
 
@@ -123,6 +128,21 @@ public class Office365ServiceImpl implements Office365Service {
     }
   }
 
+  @SuppressWarnings("unchecked")
+  public void syncMail(AppOffice365 appOffice365) throws AxelorException, MalformedURLException {
+
+    String accessToken = getAccessTocken(appOffice365);
+    URL url = new URL(MAIL_URL);
+    JSONObject jsonObject = fetchData(url, accessToken);
+    JSONArray messageArray = (JSONArray) jsonObject.getOrDefault("value", new ArrayList<>());
+    if (messageArray != null) {
+      for (Object object : messageArray) {
+        jsonObject = (JSONObject) object;
+        createMessage(jsonObject);
+      }
+    }
+  }
+
   @Transactional
   public String getAccessTocken(AppOffice365 appOffice365) throws AxelorException {
 
@@ -131,7 +151,7 @@ public class Office365ServiceImpl implements Office365Service {
           new ServiceBuilder(appOffice365.getClientId())
               .apiSecret(appOffice365.getClientSecret())
               .callback(appOffice365.getRedirectUri())
-              .defaultScope(SCOPE)
+              .defaultScope(Office365Service.SCOPE)
               .build(MicrosoftAzureActiveDirectory20Api.instance());
       OAuth2AccessToken accessToken;
       if (StringUtils.isBlank(appOffice365.getRefreshToken())) {
@@ -648,5 +668,114 @@ public class Office365ServiceImpl implements Office365Service {
       TraceBackService.trace(e);
     }
     return eventTime;
+  }
+
+  private LocalDateTime parseDateTime(String dateTimeStr) {
+
+    if (!StringUtils.isBlank(dateTimeStr)) {
+      DateTimeFormatter format = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'");
+
+      return LocalDateTime.parse(dateTimeStr, format)
+          .atZone(ZoneId.systemDefault())
+          .toLocalDateTime();
+    }
+
+    return null;
+  }
+
+  @Transactional
+  @SuppressWarnings("unchecked")
+  public void createMessage(JSONObject jsonObject) {
+
+    if (jsonObject != null) {
+      try {
+        String officeMessageId = jsonObject.getOrDefault("id", "").toString();
+        Message message = messageRepo.findByOffice365Id(officeMessageId);
+
+        if (message == null) {
+          message = new Message();
+          message.setOffice365Id(officeMessageId);
+        }
+        message.setSubject(jsonObject.getOrDefault("subject", "").toString());
+        message.setMediaTypeSelect(MessageRepository.MEDIA_TYPE_EMAIL);
+
+        LocalDateTime sentDateTime =
+            parseDateTime(jsonObject.getOrDefault("sentDateTime", "").toString());
+        LocalDateTime receivedDateTime =
+            parseDateTime(jsonObject.getOrDefault("receivedDateTime", "").toString());
+        message.setSentDateT(sentDateTime);
+        message.setReceivedDateT(receivedDateTime);
+
+        if (jsonObject.getBoolean("isDraft")) {
+          message.setStatusSelect(MessageRepository.STATUS_DRAFT);
+        } else if (jsonObject.getBoolean("isRead")) {
+          message.setStatusSelect(MessageRepository.STATUS_RECEIVED);
+        } else {
+          message.setStatusSelect(MessageRepository.STATUS_SENT);
+        }
+
+        message.setContent(jsonObject.getOrDefault("bodyPreview", "").toString());
+        /*JSONObject bodyJsonObj = (JSONObject) jsonObject.getOrDefault("body", JSONObject.NULL);
+        if (bodyJsonObj != JSONObject.NULL) {
+          // message.setContent(bodyJsonObj.getOrDefault("content", "").toString());
+        }*/
+
+        JSONObject fromJsonObj = (JSONObject) jsonObject.getOrDefault("from", JSONObject.NULL);
+        message.setFromEmailAddress(getEmailAddress(fromJsonObj));
+
+        message.setToEmailAddressSet(getEmailAddressSet(jsonObject, "toRecipients"));
+        message.setReplyToEmailAddressSet(getEmailAddressSet(jsonObject, "replyTo"));
+        message.setCcEmailAddressSet(getEmailAddressSet(jsonObject, "ccRecipients"));
+        message.setBccEmailAddressSet(getEmailAddressSet(jsonObject, "bccRecipients"));
+        message.setMailAccount(getEmailAccount(jsonObject, "sender"));
+
+        messageRepo.save(message);
+      } catch (Exception e) {
+        TraceBackService.trace(e);
+      }
+    }
+  }
+
+  private EmailAddress getEmailAddress(JSONObject jsonObject) throws JSONException {
+
+    EmailAddress emailAddress = null;
+    if (jsonObject != JSONObject.NULL) {
+      JSONObject emailAddJsonObj = jsonObject.getJSONObject("emailAddress");
+
+      String emailAddressStr = emailAddJsonObj.getString("address");
+      if (!StringUtils.isBlank(emailAddressStr)) {
+        emailAddress = emailAddressRepo.findByAddress(emailAddressStr);
+      }
+
+      if (emailAddress == null) {
+        emailAddress = new EmailAddress();
+        emailAddress.setAddress(emailAddressStr);
+      }
+      emailAddress.setName(emailAddJsonObj.getString("name"));
+    }
+
+    return emailAddress;
+  }
+
+  private Set<EmailAddress> getEmailAddressSet(JSONObject jsonObject, String key)
+      throws JSONException {
+
+    Set<EmailAddress> toEmailAddressSet = null;
+    JSONArray toJsonArr = jsonObject.getJSONArray(key);
+    if (toJsonArr != null && toJsonArr.size() > 0) {
+      toEmailAddressSet = new HashSet<>();
+      for (Object obj : toJsonArr) {
+        JSONObject toJsonObj = (JSONObject) obj;
+        toEmailAddressSet.add(getEmailAddress(toJsonObj));
+      }
+    }
+
+    return toEmailAddressSet;
+  }
+
+  private EmailAccount getEmailAccount(JSONObject jsonObject, String key) {
+
+    // create EmailAccount & related User
+    return null;
   }
 }

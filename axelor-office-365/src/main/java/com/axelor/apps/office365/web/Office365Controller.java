@@ -21,6 +21,7 @@ import com.axelor.apps.base.db.AppOffice365;
 import com.axelor.apps.base.db.ICalendar;
 import com.axelor.apps.base.db.Partner;
 import com.axelor.apps.base.db.repo.AppOffice365Repository;
+import com.axelor.apps.message.db.Message;
 import com.axelor.apps.office365.service.Office365Service;
 import com.axelor.apps.office365.translation.ITranslation;
 import com.axelor.i18n.I18n;
@@ -39,9 +40,6 @@ public class Office365Controller {
 
   @Inject private Office365Service office365Service;
 
-  private static final String SCOPE =
-      "openid offline_access Contacts.ReadWrite Calendars.ReadWrite";
-
   public void generateUrl(ActionRequest request, ActionResponse response) throws Exception {
 
     AppOffice365 appOffice365 = request.getContext().asType(AppOffice365.class);
@@ -54,7 +52,7 @@ public class Office365Controller {
         new ServiceBuilder(appOffice365.getClientId())
             .apiSecret(appOffice365.getClientSecret())
             .callback(appOffice365.getRedirectUri())
-            .defaultScope(SCOPE)
+            .defaultScope(Office365Service.SCOPE)
             .build(MicrosoftAzureActiveDirectory20Api.instance());
     String authenticationUrl =
         authService
@@ -97,6 +95,20 @@ public class Office365Controller {
             .model(ICalendar.class.getName())
             .add("grid", "calendar-grid")
             .add("form", "calendar-form")
+            .domain("self.office365Id IS NOT NULL")
+            .map());
+  }
+
+  public void syncMail(ActionRequest request, ActionResponse response) throws Exception {
+
+    AppOffice365 appOffice365 = request.getContext().asType(AppOffice365.class);
+    appOffice365 = Beans.get(AppOffice365Repository.class).find(appOffice365.getId());
+    office365Service.syncMail(appOffice365);
+    response.setView(
+        ActionView.define("Office365 mail")
+            .model(Message.class.getName())
+            .add("grid", "message-grid")
+            .add("form", "message-form")
             .domain("self.office365Id IS NOT NULL")
             .map());
   }
