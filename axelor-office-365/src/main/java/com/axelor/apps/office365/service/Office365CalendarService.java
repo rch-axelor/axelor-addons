@@ -23,7 +23,6 @@ import com.axelor.apps.base.db.ICalendarUser;
 import com.axelor.apps.base.db.repo.ICalendarEventRepository;
 import com.axelor.apps.base.db.repo.ICalendarRepository;
 import com.axelor.apps.base.db.repo.ICalendarUserRepository;
-import com.axelor.apps.base.service.user.UserService;
 import com.axelor.apps.crm.db.Event;
 import com.axelor.apps.crm.db.EventCategory;
 import com.axelor.apps.crm.db.EventReminder;
@@ -33,9 +32,15 @@ import com.axelor.apps.crm.db.repo.EventReminderRepository;
 import com.axelor.apps.crm.db.repo.EventRepository;
 import com.axelor.apps.crm.db.repo.RecurrenceConfigurationRepository;
 import com.axelor.apps.crm.service.EventService;
+import com.axelor.apps.office.db.Office365Account;
+import com.axelor.apps.office.db.Office365ICalendar;
+import com.axelor.apps.office.db.Office365ICalendarEvent;
+import com.axelor.apps.office.db.repo.Office365ICalendarEventRepository;
+import com.axelor.apps.office.db.repo.Office365ICalendarRepository;
 import com.axelor.auth.AuthUtils;
 import com.axelor.auth.db.User;
 import com.axelor.auth.db.repo.UserRepository;
+import com.axelor.common.ObjectUtils;
 import com.axelor.exception.service.TraceBackService;
 import com.axelor.inject.Beans;
 import com.google.inject.Inject;
@@ -48,7 +53,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
-import org.apache.commons.collections.CollectionUtils;
+import java.util.Optional;
 import org.apache.commons.lang3.StringUtils;
 import wslite.json.JSONArray;
 import wslite.json.JSONException;
@@ -59,15 +64,18 @@ public class Office365CalendarService {
   @Inject private Office365Service office365Service;
 
   @Inject private ICalendarEventRepository eventRepo;
+  @Inject private Office365ICalendarEventRepository office365ICalendarEventRepo;
   @Inject private EventCategoryRepository eventCategoryRepo;
   @Inject private ICalendarRepository iCalendarRepo;
+  @Inject private Office365ICalendarRepository office365ICalendarRepo;
   @Inject private ICalendarUserRepository iCalendarUserRepo;
   @Inject private EventReminderRepository eventReminderRepo;
   @Inject private RecurrenceConfigurationRepository recurrenceConfigurationRepo;
   @Inject private UserRepository userRepo;
 
   @Transactional
-  public ICalendar createCalendar(JSONObject jsonObject, String login, LocalDateTime lastSyncOn) {
+  public ICalendar createCalendar(
+      JSONObject jsonObject, Office365Account office365Account, LocalDateTime lastSyncOn) {
 
     if (jsonObject == null) {
       return null;
@@ -76,15 +84,25 @@ public class Office365CalendarService {
     ICalendar iCalendar = null;
     try {
       String office365Id = office365Service.processJsonValue("id", jsonObject);
-      iCalendar = iCalendarRepo.findByOffice365Id(office365Id);
+      Office365ICalendar office365iCalendar =
+          office365ICalendarRepo.findOffice365Calendar(office365Id, office365Account);
+      iCalendar = office365iCalendar == null ? null : office365iCalendar.getCalendar();
       if (iCalendar == null) {
         iCalendar = new ICalendar();
-        iCalendar.setOffice365Id(office365Id);
+        iCalendar.setIsOffice365Object(true);
       }
 
       iCalendar.setName(office365Service.processJsonValue("name", jsonObject));
       setCalendarOwer(jsonObject, iCalendar);
       iCalendarRepo.save(iCalendar);
+
+      if (office365iCalendar == null) {
+        office365iCalendar = new Office365ICalendar();
+        office365iCalendar.setOffice365Id(office365Id);
+        office365iCalendar.setOffice365Account(office365Account);
+        iCalendar.addOffice365CalendarListItem(office365iCalendar);
+        office365ICalendarRepo.save(office365iCalendar);
+      }
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
@@ -93,21 +111,43 @@ public class Office365CalendarService {
   }
 
   @Transactional
-  public void createOffice365Calendar(ICalendar calendar, String accessToken) {
+  public void createOffice365Calendar(
+      ICalendar calendar, Office365Account office365Account, String accessToken) {
 
     try {
       JSONObject calendarJsonObject = new JSONObject();
       office365Service.putObjValue(calendarJsonObject, "name", calendar.getName());
       office365Service.putUserEmailAddress(calendar.getUser(), calendarJsonObject, "owner");
-      String office365Id =
+
+      String office365Id = null;
+      Office365ICalendar office365Calendar = null;
+      if (ObjectUtils.notEmpty(calendar.getOffice365CalendarList())) {
+        Optional<Office365ICalendar> office365CalendarOpt =
+            calendar.getOffice365CalendarList().stream()
+                .filter(oCalendar -> oCalendar.getOffice365Account().equals(office365Account))
+                .findFirst();
+        if (office365CalendarOpt.isPresent()) {
+          office365Calendar = office365CalendarOpt.get();
+          office365Id = office365Calendar.getOffice365Id();
+        }
+      }
+
+      if (office365Calendar == null) {
+        office365Calendar = new Office365ICalendar();
+        office365Calendar.setOffice365Account(office365Account);
+        office365Calendar.setCalendar(calendar);
+      }
+
+      office365Id =
           office365Service.createOffice365Object(
               Office365Service.CALENDAR_URL,
               calendarJsonObject,
               accessToken,
-              calendar.getOffice365Id(),
+              office365Id,
               "Calendars");
-      calendar.setOffice365Id(office365Id);
-      iCalendarRepo.save(calendar);
+
+      office365Calendar.setOffice365Id(office365Id);
+      office365ICalendarRepo.save(office365Calendar);
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
@@ -116,6 +156,7 @@ public class Office365CalendarService {
   @Transactional
   public void createEvent(
       JSONObject jsonObject,
+      Office365Account office365Account,
       ICalendar iCalendar,
       ICalendar defaultCalendar,
       LocalDateTime lastSyncOn) {
@@ -126,11 +167,13 @@ public class Office365CalendarService {
 
     try {
       String office365Id = office365Service.processJsonValue("id", jsonObject);
-      ICalendarEvent event = eventRepo.findByOffice365Id(office365Id);
+      Office365ICalendarEvent office365Event =
+          office365ICalendarEventRepo.findOffice365Event(office365Id, office365Account);
 
+      ICalendarEvent event = office365Event == null ? null : office365Event.getEvent();
       if (event == null) {
         event = new Event();
-        event.setOffice365Id(office365Id);
+        event.setIsOffice365Object(true);
         event.setTypeSelect(EventRepository.TYPE_EVENT);
 
       } else if (!office365Service.needUpdation(
@@ -138,8 +181,18 @@ public class Office365CalendarService {
         return;
       }
 
-      setEventValues(jsonObject, event, iCalendar, defaultCalendar);
+      setEventValues(
+          jsonObject, event, iCalendar, defaultCalendar, office365Account.getOwnerUser());
       eventRepo.save(event);
+
+      if (office365Event == null) {
+        office365Event = new Office365ICalendarEvent();
+        office365Event.setOffice365Id(office365Id);
+        office365Event.setOffice365Account(office365Account);
+        event.addOffice365EventListItem(office365Event);
+        office365ICalendarEventRepo.save(office365Event);
+      }
+
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
@@ -147,30 +200,77 @@ public class Office365CalendarService {
 
   @Transactional
   public void createOffice365Event(
-      ICalendarEvent event, String accessToken, User currentUser, ICalendar defaultCalendar) {
+      ICalendarEvent event,
+      Office365Account office365Account,
+      String accessToken,
+      User currentUser,
+      ICalendar defaultCalendar) {
 
     try {
-      String calendarId = null;
-      if (event.getCalendar() != null
-          && StringUtils.isNotBlank(event.getCalendar().getOffice365Id())) {
-        calendarId = event.getCalendar().getOffice365Id();
-      } else if (defaultCalendar != null
-          && StringUtils.isNotBlank(defaultCalendar.getOffice365Id())) {
-        calendarId = defaultCalendar.getOffice365Id();
-      } else {
+      String calendarId = getCalendarOffice365Id(event, defaultCalendar, office365Account);
+      if (calendarId == null) {
         return;
       }
 
       JSONObject eventJsonObject = setOffice365EventValues(event, currentUser);
       String urlStr = String.format(Office365Service.EVENT_URL, calendarId);
-      String office365Id =
+      String office365Id = null;
+      Office365ICalendarEvent office365Event = null;
+      if (ObjectUtils.notEmpty(event.getOffice365EventList())) {
+        Optional<Office365ICalendarEvent> office365EventOpt =
+            event.getOffice365EventList().stream()
+                .filter(oEvent -> oEvent.getOffice365Account().equals(office365Account))
+                .findFirst();
+        if (office365EventOpt.isPresent()) {
+          office365Event = office365EventOpt.get();
+          office365Id = office365Event.getOffice365Id();
+        }
+      }
+
+      if (office365Event == null) {
+        office365Event = new Office365ICalendarEvent();
+        office365Event.setOffice365Account(office365Account);
+        office365Event.setEvent(event);
+      }
+
+      office365Id =
           office365Service.createOffice365Object(
-              urlStr, eventJsonObject, accessToken, event.getOffice365Id(), "Events");
-      event.setOffice365Id(office365Id);
-      eventRepo.save(event);
+              urlStr, eventJsonObject, accessToken, office365Id, "Events");
+      office365Event.setOffice365Id(office365Id);
+      office365ICalendarEventRepo.save(office365Event);
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
+  }
+
+  private String getCalendarOffice365Id(
+      ICalendarEvent event, ICalendar defaultCalendar, Office365Account office365Account) {
+
+    String calendarId = null;
+    Optional<Office365ICalendar> office365CalendarOpt;
+    if (event.getCalendar() != null
+        && !ObjectUtils.isEmpty(event.getCalendar().getOffice365CalendarList())) {
+      office365CalendarOpt =
+          event.getCalendar().getOffice365CalendarList().stream()
+              .filter(oCalendar -> oCalendar.getOffice365Account().equals(office365Account))
+              .findFirst();
+      calendarId =
+          office365CalendarOpt.isPresent() ? office365CalendarOpt.get().getOffice365Id() : null;
+    }
+
+    if (calendarId == null) {
+      office365CalendarOpt =
+          ObjectUtils.isEmpty(defaultCalendar.getOffice365CalendarList())
+              ? null
+              : defaultCalendar.getOffice365CalendarList().stream()
+                  .filter(oCalendar -> oCalendar.getOffice365Account().equals(office365Account))
+                  .findFirst();
+      if (office365CalendarOpt != null && office365CalendarOpt.isPresent()) {
+        calendarId = office365CalendarOpt.get().getOffice365Id();
+      }
+    }
+
+    return calendarId;
   }
 
   @SuppressWarnings("unchecked")
@@ -197,12 +297,16 @@ public class Office365CalendarService {
 
   @SuppressWarnings("unchecked")
   private void setEventValues(
-      JSONObject jsonObject, ICalendarEvent event, ICalendar iCalendar, ICalendar defaultCalendar)
+      JSONObject jsonObject,
+      ICalendarEvent event,
+      ICalendar iCalendar,
+      ICalendar defaultCalendar,
+      User ownerUser)
       throws JSONException {
 
     event.setSubject(jsonObject.getOrDefault("subject", "").toString());
     event.setAllDay((Boolean) jsonObject.getOrDefault("isAllDay", false));
-    event.setUser(Beans.get(UserService.class).getUser());
+    event.setUser(ownerUser);
 
     JSONObject startObject = jsonObject.getJSONObject("start");
     event.setStartDateTime(getLocalDateTime(startObject));
@@ -646,7 +750,7 @@ public class Office365CalendarService {
 
   private void putAttendees(ICalendarEvent event, JSONObject eventJsonObject) throws JSONException {
 
-    if (CollectionUtils.isEmpty(event.getAttendees())) {
+    if (ObjectUtils.isEmpty(event.getAttendees())) {
       return;
     }
 
@@ -670,7 +774,7 @@ public class Office365CalendarService {
 
   private void putReminder(Event event, JSONObject eventJsonObject) throws JSONException {
 
-    if (CollectionUtils.isEmpty(event.getEventReminderList())) {
+    if (ObjectUtils.isEmpty(event.getEventReminderList())) {
       return;
     }
 
