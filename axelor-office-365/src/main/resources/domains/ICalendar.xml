@@ -7,8 +7,7 @@
 	<module name="base" package="com.axelor.apps.base.db" />
 
 	<entity name="ICalendar" table="ICAL_CALENDAR" sequential="true">
-		<string name="office365Id" title="Office365 id" />
-
-		<finder-method name="findByOffice365Id" using="office365Id" />
+		<one-to-many name="office365CalendarList" ref="com.axelor.apps.office.db.Office365ICalendar" mappedBy="calendar"/>
+		<boolean name="isOffice365Object"/>
 	</entity>
 </domain-models>

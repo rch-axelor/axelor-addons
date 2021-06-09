@@ -30,6 +30,12 @@ import com.axelor.apps.base.db.repo.PartnerRepository;
 import com.axelor.apps.base.service.PartnerService;
 import com.axelor.apps.message.db.EmailAddress;
 import com.axelor.apps.message.db.repo.EmailAddressRepository;
+import com.axelor.apps.office.db.Office365Account;
+import com.axelor.apps.office.db.Office365Partner;
+import com.axelor.apps.office.db.repo.Office365PartnerRepository;
+import com.axelor.auth.db.User;
+import com.axelor.common.ObjectUtils;
+import com.axelor.common.StringUtils;
 import com.axelor.exception.service.TraceBackService;
 import com.axelor.inject.Beans;
 import com.google.common.base.Strings;
@@ -38,8 +44,7 @@ import com.google.inject.persist.Transactional;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
-import org.apache.commons.collections.CollectionUtils;
-import org.apache.commons.lang3.StringUtils;
+import java.util.Optional;
 import wslite.json.JSONArray;
 import wslite.json.JSONException;
 import wslite.json.JSONObject;
@@ -50,12 +55,15 @@ public class Office365ContactService {
   @Inject private Office365Service office365Service;
 
   @Inject private PartnerRepository partnerRepo;
+  @Inject private Office365PartnerRepository office365PartnerRepo;
   @Inject private EmailAddressRepository emailAddressRepo;
   @Inject private AddressRepository addressRepo;
   @Inject private PartnerAddressRepository partnerAddressRepo;
 
+  @Transactional
   @SuppressWarnings("unchecked")
-  public void createContact(JSONObject jsonObject, LocalDateTime lastSyncOn) {
+  public void createContact(
+      JSONObject jsonObject, Office365Account office365Account, LocalDateTime lastSyncOn) {
 
     if (jsonObject == null) {
       return;
@@ -63,11 +71,13 @@ public class Office365ContactService {
 
     try {
       String officeContactId = jsonObject.getOrDefault("id", "").toString();
-      Partner partner = partnerRepo.findByOffice365Id(officeContactId);
+      Office365Partner office365Partner =
+          office365PartnerRepo.findOffice365Partner(officeContactId, office365Account);
 
+      Partner partner = office365Partner == null ? null : office365Partner.getPartner();
       if (partner == null) {
         partner = new Partner();
-        partner.setOffice365Id(officeContactId);
+        partner.setIsOffice365Object(true);
         partner.setIsContact(true);
         partner.setPartnerTypeSelect(PartnerRepository.PARTNER_TYPE_INDIVIDUAL);
 
@@ -76,14 +86,23 @@ public class Office365ContactService {
         return;
       }
 
-      setPartnerValues(partner, jsonObject);
+      setPartnerValues(partner, jsonObject, office365Account.getOwnerUser());
+
+      if (office365Partner == null) {
+        office365Partner = new Office365Partner();
+        office365Partner.setOffice365Id(officeContactId);
+        office365Partner.setOffice365Account(office365Account);
+        partner.addOffice365PartnerListItem(office365Partner);
+        office365PartnerRepo.save(office365Partner);
+      }
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
   }
 
   @Transactional
-  public void setPartnerValues(Partner partner, JSONObject jsonObject) throws JSONException {
+  public void setPartnerValues(Partner partner, JSONObject jsonObject, User user)
+      throws JSONException {
 
     managePartnerName(jsonObject, partner);
     partner.setCompanyStr(office365Service.processJsonValue("companyName", jsonObject));
@@ -92,6 +111,7 @@ public class Office365ContactService {
     partner.setDescription(office365Service.processJsonValue("personalNotes", jsonObject));
     partner.setJobTitle(office365Service.processJsonValue("jobTitle", jsonObject));
     partner.setNickName(office365Service.processJsonValue("nickName", jsonObject));
+    partner.setUser(user);
 
     LocalDateTime dob =
         office365Service.processLocalDateTimeValue(jsonObject, "birthday", ZoneId.systemDefault());
@@ -109,19 +129,41 @@ public class Office365ContactService {
   }
 
   @Transactional
-  public void createOffice365Contact(Partner partner, String accessToken) {
+  public void createOffice365Contact(
+      Partner partner, Office365Account office365Account, String accessToken) {
 
     try {
       JSONObject contactJsonObject = setOffice365ContactValues(partner);
-      String office365Id =
+
+      String office365Id = null;
+      Office365Partner office365Partner = null;
+      if (!ObjectUtils.isEmpty(partner.getOffice365PartnerList())) {
+        Optional<Office365Partner> office365PartnerOpt =
+            partner.getOffice365PartnerList().stream()
+                .filter(oPartner -> oPartner.getOffice365Account().equals(office365Account))
+                .findFirst();
+        if (office365PartnerOpt.isPresent()) {
+          office365Partner = office365PartnerOpt.get();
+          office365Id = office365Partner.getOffice365Id();
+        }
+      }
+
+      if (office365Partner == null) {
+        office365Partner = new Office365Partner();
+        office365Partner.setOffice365Account(office365Account);
+        partner.addOffice365PartnerListItem(office365Partner);
+      }
+
+      office365Id =
           office365Service.createOffice365Object(
               Office365Service.CONTACT_URL,
               contactJsonObject,
               accessToken,
-              partner.getOffice365Id(),
+              office365Id,
               "Contacts");
-      partner.setOffice365Id(office365Id);
-      partnerRepo.save(partner);
+
+      office365Partner.setOffice365Id(office365Id);
+      office365PartnerRepo.save(office365Partner);
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
@@ -266,13 +308,13 @@ public class Office365ContactService {
       address.setAddressL4(office365Service.processJsonValue("street", jsonAddressObj));
 
       String cityStr = office365Service.processJsonValue("city", jsonAddressObj);
-      if (StringUtils.isNotBlank(cityStr)) {
+      if (StringUtils.notBlank(cityStr)) {
         City city = Beans.get(CityRepository.class).findByName(cityStr);
         if (city != null) address.setCity(city);
       }
 
       String countryStr = jsonAddressObj.getOrDefault("countryOrRegion", "").toString();
-      if (StringUtils.isNotBlank(countryStr)) {
+      if (StringUtils.notBlank(countryStr)) {
         Country country = Beans.get(CountryRepository.class).findByName(countryStr);
         if (country != null) address.setAddressL7Country(country);
       }
@@ -319,10 +361,10 @@ public class Office365ContactService {
     office365Service.putObjValue(contactJsonObject, "title", title);
 
     JSONArray phoneJsonArr = new JSONArray();
-    if (StringUtils.isNotBlank(partner.getFixedPhone())) {
+    if (StringUtils.notBlank(partner.getFixedPhone())) {
       phoneJsonArr.add(partner.getFixedPhone());
     }
-    if (CollectionUtils.isNotEmpty(phoneJsonArr)) {
+    if (ObjectUtils.notEmpty(phoneJsonArr)) {
       contactJsonObject.put("homePhones", (Object) phoneJsonArr);
     }
 
@@ -345,9 +387,7 @@ public class Office365ContactService {
     office365Service.putObjValue(emailJsonObj, "address", emailAddress.getAddress());
     String emailName = emailAddress.getName();
     office365Service.putObjValue(
-        emailJsonObj,
-        "name",
-        StringUtils.isNotBlank(emailName) ? emailName : partner.getFullName());
+        emailJsonObj, "name", StringUtils.notBlank(emailName) ? emailName : partner.getFullName());
     emailJsonArr.add(emailJsonObj);
     contactJsonObject.put("emailAddresses", (Object) emailJsonArr);
   }
@@ -360,7 +400,7 @@ public class Office365ContactService {
     }
 
     List<PartnerAddress> partnerAddressList = partner.getPartnerAddressList();
-    if (CollectionUtils.isEmpty(partnerAddressList)) {
+    if (ObjectUtils.isEmpty(partnerAddressList)) {
       return;
     }
 

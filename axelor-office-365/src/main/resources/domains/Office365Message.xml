@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<domain-models xmlns="http://axelor.com/xml/ns/domain-models"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://axelor.com/xml/ns/domain-models http://axelor.com/xml/ns/domain-models/domain-models_5.2.xsd">
+
+	<module name="office" package="com.axelor.apps.office.db" />
+
+	<entity name="Office365Message" lang="java">
+		<string name="office365Id" title="Office365 id"/>
+		<many-to-one name="office365Account" ref="com.axelor.apps.office.db.Office365Account" title="Office365 account"/>
+		<many-to-one name="message" ref="com.axelor.apps.message.db.Message"/>
+
+		<finder-method name="findOffice365Message" using="office365Id,office365Account"/>
+	</entity>
+
+</domain-models>

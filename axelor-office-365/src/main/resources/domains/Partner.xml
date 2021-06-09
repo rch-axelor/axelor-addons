@@ -7,12 +7,11 @@
 	<module name="base" package="com.axelor.apps.base.db" />
 
 	<entity name="Partner" lang="java">
-		<string name="office365Id" title="Office365 id"/>
+		<one-to-many name="office365PartnerList" ref="com.axelor.apps.office.db.Office365Partner" mappedBy="partner"/>
+		<boolean name="isOffice365Object"/>
 		<date name="birthdate" title="Birth date" />
 		<string name="nickName" title="Nick name"/>
 		<string name="jobTitle" title="Job title"/>
-
-		<finder-method name="findByOffice365Id" using="office365Id"/>
 	</entity>
 
 </domain-models>

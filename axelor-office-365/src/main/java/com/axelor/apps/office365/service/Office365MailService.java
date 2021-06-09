@@ -25,8 +25,13 @@ import com.axelor.apps.message.db.Message;
 import com.axelor.apps.message.db.repo.EmailAccountRepository;
 import com.axelor.apps.message.db.repo.EmailAddressRepository;
 import com.axelor.apps.message.db.repo.MessageRepository;
+import com.axelor.apps.office.db.Office365Account;
+import com.axelor.apps.office.db.Office365Message;
+import com.axelor.apps.office.db.repo.Office365MessageRepository;
 import com.axelor.auth.db.User;
 import com.axelor.auth.db.repo.UserRepository;
+import com.axelor.common.ObjectUtils;
+import com.axelor.common.StringUtils;
 import com.axelor.exception.service.TraceBackService;
 import com.google.inject.Inject;
 import com.google.inject.persist.Transactional;
@@ -34,9 +39,8 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.HashSet;
+import java.util.Optional;
 import java.util.Set;
-import org.apache.commons.collections.CollectionUtils;
-import org.apache.commons.lang3.StringUtils;
 import wslite.json.JSONArray;
 import wslite.json.JSONException;
 import wslite.json.JSONObject;
@@ -46,6 +50,7 @@ public class Office365MailService {
   @Inject private EmailAddressRepository emailAddressRepo;
   @Inject private EmailAccountRepository emailAccountRepo;
   @Inject private MessageRepository messageRepo;
+  @Inject private Office365MessageRepository office365MessageRepo;
   @Inject private UserRepository userRepo;
   @Inject private PartnerRepository partnerRepository;
 
@@ -53,72 +58,111 @@ public class Office365MailService {
 
   @Transactional
   @SuppressWarnings("unchecked")
-  public void createMessage(JSONObject jsonObject, LocalDateTime lastSyncOn) {
+  public void createMessage(
+      JSONObject jsonObject, Office365Account office365Account, LocalDateTime lastSyncOn) {
 
-    if (jsonObject != null) {
-      try {
-        String officeMessageId = office365Service.processJsonValue("id", jsonObject);
-        Message message = messageRepo.findByOffice365Id(officeMessageId);
+    if (jsonObject == null) {
+      return;
+    }
 
-        if (message == null) {
-          message = new Message();
-          message.setOffice365Id(officeMessageId);
+    try {
+      String officeMessageId = office365Service.processJsonValue("id", jsonObject);
+      Office365Message office365Message =
+          office365MessageRepo.findOffice365Message(officeMessageId, office365Account);
 
-        } else if (!office365Service.needUpdation(
-            jsonObject, lastSyncOn, message.getCreatedOn(), message.getUpdatedOn())) {
-          return;
-        }
+      Message message = office365Message == null ? null : office365Message.getMessage();
+      if (message == null) {
+        message = new Message();
+        message.setIsOffice365Object(true);
 
-        message.setSubject(office365Service.processJsonValue("subject", jsonObject));
-        message.setContent(office365Service.processJsonValue("bodyPreview", jsonObject));
-        message.setMediaTypeSelect(MessageRepository.MEDIA_TYPE_EMAIL);
-
-        message.setSentDateT(
-            office365Service.processLocalDateTimeValue(
-                jsonObject, "sentDateTime", ZoneId.systemDefault()));
-        message.setReceivedDateT(
-            office365Service.processLocalDateTimeValue(
-                jsonObject, "receivedDateTime", ZoneId.systemDefault()));
-
-        if (jsonObject.getBoolean("isDraft")) {
-          message.setStatusSelect(MessageRepository.STATUS_DRAFT);
-        } else if (jsonObject.getBoolean("isRead")) {
-          message.setTypeSelect(MessageRepository.TYPE_RECEIVED);
-        } else {
-          message.setStatusSelect(MessageRepository.STATUS_SENT);
-          message.setTypeSelect(MessageRepository.TYPE_SENT);
-        }
-
-        JSONObject fromJsonObj = (JSONObject) jsonObject.getOrDefault("from", JSONObject.NULL);
-        message.setFromEmailAddress(getEmailAddress(fromJsonObj));
-
-        message.setToEmailAddressSet(getEmailAddressSet(jsonObject, "toRecipients"));
-        message.setReplyToEmailAddressSet(getEmailAddressSet(jsonObject, "replyTo"));
-        message.setCcEmailAddressSet(getEmailAddressSet(jsonObject, "ccRecipients"));
-        message.setBccEmailAddressSet(getEmailAddressSet(jsonObject, "bccRecipients"));
-        setSender(jsonObject, message);
-
-        messageRepo.save(message);
-      } catch (Exception e) {
-        TraceBackService.trace(e);
+      } else if (!office365Service.needUpdation(
+          jsonObject, lastSyncOn, message.getCreatedOn(), message.getUpdatedOn())) {
+        return;
       }
+
+      message.setSubject(office365Service.processJsonValue("subject", jsonObject));
+      message.setMediaTypeSelect(MessageRepository.MEDIA_TYPE_EMAIL);
+      message.setSentDateT(
+          office365Service.processLocalDateTimeValue(
+              jsonObject, "sentDateTime", ZoneId.systemDefault()));
+      message.setReceivedDateT(
+          office365Service.processLocalDateTimeValue(
+              jsonObject, "receivedDateTime", ZoneId.systemDefault()));
+
+      if (jsonObject.containsKey("body")) {
+        JSONObject bodyJsonObj = (JSONObject) jsonObject.get("body");
+        if (bodyJsonObj.containsKey("content")) {
+          message.setContent(office365Service.processJsonValue("content", bodyJsonObj));
+        } else {
+          message.setContent(office365Service.processJsonValue("bodyPreview", jsonObject));
+        }
+      }
+
+      if (jsonObject.getBoolean("isDraft")) {
+        message.setStatusSelect(MessageRepository.STATUS_DRAFT);
+      } else if (jsonObject.getBoolean("isRead")) {
+        message.setTypeSelect(MessageRepository.TYPE_RECEIVED);
+      } else {
+        message.setStatusSelect(MessageRepository.STATUS_SENT);
+        message.setTypeSelect(MessageRepository.TYPE_SENT);
+      }
+
+      JSONObject fromJsonObj = (JSONObject) jsonObject.getOrDefault("from", JSONObject.NULL);
+      message.setFromEmailAddress(getEmailAddress(fromJsonObj));
+
+      message.setToEmailAddressSet(getEmailAddressSet(jsonObject, "toRecipients"));
+      message.setReplyToEmailAddressSet(getEmailAddressSet(jsonObject, "replyTo"));
+      message.setCcEmailAddressSet(getEmailAddressSet(jsonObject, "ccRecipients"));
+      message.setBccEmailAddressSet(getEmailAddressSet(jsonObject, "bccRecipients"));
+      setSender(jsonObject, message);
+
+      messageRepo.save(message);
+
+      if (office365Message == null) {
+        office365Message = new Office365Message();
+        office365Message.setOffice365Id(officeMessageId);
+        office365Message.setOffice365Account(office365Account);
+        message.addOffice365MessageListItem(office365Message);
+        office365MessageRepo.save(office365Message);
+      }
+
+    } catch (Exception e) {
+      TraceBackService.trace(e);
     }
   }
 
   @Transactional
-  public void createOffice365Mail(Message message, String accessToken) {
+  public void createOffice365Mail(
+      Message message, Office365Account office365Account, String accessToken) {
 
     try {
       JSONObject messageJsonObject = setOffice365MailValues(message);
-      String office365Id =
+      String office365Id = null;
+      Office365Message office365Messge = null;
+      if (!ObjectUtils.isEmpty(message.getOffice365MessageList())) {
+        Optional<Office365Message> office365MessageOpt =
+            message.getOffice365MessageList().stream()
+                .filter(oPartner -> oPartner.getOffice365Account().equals(office365Account))
+                .findFirst();
+        if (office365MessageOpt.isPresent()) {
+          office365Messge = office365MessageOpt.get();
+          office365Id = office365Messge.getOffice365Id();
+        }
+      }
+
+      if (office365Messge == null) {
+        office365Messge = new Office365Message();
+        office365Messge.setOffice365Account(office365Account);
+        message.addOffice365MessageListItem(office365Messge);
+      }
+
+      office365Id =
           office365Service.createOffice365Object(
-              Office365Service.MAIL_URL,
-              messageJsonObject,
-              accessToken,
-              message.getOffice365Id(),
-              "Messages");
-      message.setOffice365Id(office365Id);
-      messageRepo.save(message);
+              Office365Service.MAIL_URL, messageJsonObject, accessToken, office365Id, "Messages");
+
+      office365Messge.setOffice365Id(office365Id);
+      office365MessageRepo.save(office365Messge);
+
     } catch (Exception e) {
       TraceBackService.trace(e);
     }
@@ -131,7 +175,7 @@ public class Office365MailService {
 
     JSONObject bodyJsonObject = new JSONObject();
     bodyJsonObject.put("content", message.getContent());
-    bodyJsonObject.put("contentType", "text");
+    bodyJsonObject.put("contentType", "html");
     messageJsonObject.put("body", (Object) bodyJsonObject);
     messageJsonObject.put("importance", "Low");
 
@@ -245,7 +289,7 @@ public class Office365MailService {
   private void manageOffice365EmailAddresses(
       JSONObject jsonObject, String key, Set<EmailAddress> emailAddressSet) throws JSONException {
 
-    if (CollectionUtils.isEmpty(emailAddressSet)) {
+    if (ObjectUtils.isEmpty(emailAddressSet)) {
       return;
     }
 

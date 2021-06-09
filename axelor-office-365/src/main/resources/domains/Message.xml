@@ -6,12 +6,9 @@
 	<module name="message" package="com.axelor.apps.message.db" />
 
 	<entity name="Message" lang="java">
-
-		<string name="office365Id" title="Office365 id" />
+		<one-to-many name="office365MessageList" ref="com.axelor.apps.office.db.Office365Message" mappedBy="message"/>
+		<boolean name="isOffice365Object"/>
 		<datetime name="receivedDateT" title="Received date" readonly="true"/>
-
-		<finder-method name="findByOffice365Id" using="office365Id" />
-
 	</entity>
 
 </domain-models>
