@@ -31,10 +31,12 @@ import com.axelor.apps.base.service.PartnerService;
 import com.axelor.apps.message.db.EmailAddress;
 import com.axelor.apps.message.db.repo.EmailAddressRepository;
 import com.axelor.apps.office.db.OfficeAccount;
+import com.axelor.apps.office365.translation.ITranslation;
 import com.axelor.auth.db.User;
 import com.axelor.common.ObjectUtils;
 import com.axelor.common.StringUtils;
 import com.axelor.exception.service.TraceBackService;
+import com.axelor.i18n.I18n;
 import com.axelor.inject.Beans;
 import com.google.common.base.Strings;
 import com.google.inject.Inject;
@@ -59,11 +61,11 @@ public class Office365ContactService {
   @Inject private PartnerAddressRepository partnerAddressRepo;
 
   @SuppressWarnings("unchecked")
-  public void createContact(
+  public Partner createContact(
       JSONObject jsonObject, OfficeAccount officeAccount, LocalDateTime lastSyncOn) {
 
     if (jsonObject == null) {
-      return;
+      return null;
     }
 
     try {
@@ -78,12 +80,17 @@ public class Office365ContactService {
 
       } else if (!office365Service.needUpdation(
           jsonObject, lastSyncOn, partner.getCreatedOn(), partner.getUpdatedOn())) {
-        return;
+        return partner;
       }
 
       setPartnerValues(partner, jsonObject, officeAccount.getOwnerUser(), officeAccount);
+      Office365Service.LOG.debug(
+          String.format(
+              I18n.get(ITranslation.OFFICE365_OBJECT_SYNC_SUCESS), "contact", partner.toString()));
+      return partner;
     } catch (Exception e) {
       TraceBackService.trace(e);
+      return null;
     }
   }
 
@@ -122,6 +129,11 @@ public class Office365ContactService {
       Partner partner, OfficeAccount officeAccount, String accessToken) {
 
     try {
+      if (partner.getOffice365Id() != null
+          && partner.getOffice365Id().startsWith(COMPANY_OFFICE_ID_PREFIX)) {
+        return;
+      }
+
       JSONObject contactJsonObject = setOffice365ContactValues(partner);
       String office365Id =
           office365Service.createOffice365Object(
@@ -129,7 +141,8 @@ public class Office365ContactService {
               contactJsonObject,
               accessToken,
               partner.getOffice365Id(),
-              "contacts");
+              "contacts",
+              "contact");
       partner.setOffice365Id(office365Id);
       partner.setOfficeAccount(officeAccount);
       partnerRepo.save(partner);
@@ -139,24 +152,76 @@ public class Office365ContactService {
   }
 
   @Transactional
+  public void removeContact(List<Long> partnerIdList, OfficeAccount officeAccount) {
+
+    if (ObjectUtils.isEmpty(partnerIdList)) {
+      return;
+    }
+
+    List<Partner> removalPartnerList =
+        partnerRepo
+            .all()
+            .filter(
+                "self.id NOT IN :ids AND self.office365Id IS NOT NULL AND self.officeAccount = :officeAccount")
+            .bind("officeAccount", officeAccount)
+            .bind("ids", partnerIdList)
+            .fetch();
+
+    for (Partner partner : removalPartnerList) {
+      List<Partner> parentPartners =
+          partnerRepo
+              .all()
+              .filter(":partner MEMBER OF self.contactPartnerSet")
+              .bind("partner", partner)
+              .fetch();
+      parentPartners.forEach(
+          parent -> {
+            parent.removeContactPartnerSetItem(partner);
+            partnerRepo.save(parent);
+          });
+      partner.setOffice365Id(null);
+      partnerRepo.remove(partner);
+    }
+  }
+
+  @Transactional
   public void manageCompany(
       JSONObject jsonObject, Partner partner, User user, OfficeAccount officeAccount) {
 
     String companyName = office365Service.processJsonValue("companyName", jsonObject);
+    String companyOffice365Id = COMPANY_OFFICE_ID_PREFIX + partner.getOffice365Id();
+    Partner company;
     if (StringUtils.isBlank(companyName)) {
+      if (partner.getMainPartner() == null) {
+        return;
+      }
+
+      company = partner.getMainPartner();
+      company.removeContactPartnerSetItem(partner);
+      partner.setMainPartner(null);
+      if (ObjectUtils.isEmpty(company.getContactPartnerSet())
+          && company.getOffice365Id() != null
+          && company.getOffice365Id().equals(companyOffice365Id)) {
+        partnerRepo.remove(company);
+      } else {
+        partnerRepo.save(company);
+      }
       return;
     }
 
-    String office365Id = partner.getOffice365Id();
-    Partner company = partnerRepo.findByOffice365Id(COMPANY_OFFICE_ID_PREFIX + office365Id);
+    company = partnerRepo.findByOffice365Id(companyOffice365Id);
+    if (company == null) {
+      company = partnerRepo.findByName(companyName);
+    }
+
     if (company == null) {
       company = new Partner();
       company.setPartnerTypeSelect(PartnerRepository.PARTNER_TYPE_COMPANY);
       company.setIsCustomer(true);
       company.setOfficeAccount(officeAccount);
-      company.setOffice365Id(COMPANY_OFFICE_ID_PREFIX + office365Id);
     }
 
+    company.setOffice365Id(companyOffice365Id);
     company.setName(companyName);
     company.setFullName(companyName);
     company.setUser(user);

@@ -50,6 +50,7 @@ import java.net.URL;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -60,6 +61,7 @@ import okhttp3.Request.Builder;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.http.client.utils.URIBuilder;
 import wslite.http.HTTPClient;
 import wslite.http.HTTPMethod;
 import wslite.http.HTTPRequest;
@@ -81,7 +83,7 @@ public class Office365ServiceImpl implements Office365Service {
 
   private static String query = "(self.office365Id IS NULL AND self.createdOn < :start)";
   private static String lastSyncQuery =
-      "COALESCE(self.updatedOn, self.createdOn) BETWEEN :lastSync AND :start";
+      "(self.office365Id IS NULL OR (COALESCE(self.updatedOn, self.createdOn) BETWEEN :lastSync AND :start))";
 
   @Override
   @SuppressWarnings("unchecked")
@@ -142,7 +144,12 @@ public class Office365ServiceImpl implements Office365Service {
   }
 
   public String createOffice365Object(
-      String urlStr, JSONObject jsonObject, String accessToken, String office365Id, String key) {
+      String urlStr,
+      JSONObject jsonObject,
+      String accessToken,
+      String office365Id,
+      String key,
+      String type) {
 
     try {
       if (office365Id != null) {
@@ -167,10 +174,25 @@ public class Office365ServiceImpl implements Office365Service {
       Request request = builder.build();
       OkHttpClient httpClient = new OkHttpClient();
       try (Response response = httpClient.newCall(request).execute()) {
-        if (response.isSuccessful() && office365Id == null) {
-          office365Id =
-              StringUtils.substringBetween(
-                  response.networkResponse().header("Location"), "/" + key + "('", "')");
+        if (response.isSuccessful()) {
+          if (office365Id == null) {
+            office365Id =
+                StringUtils.substringBetween(
+                    response.networkResponse().header("Location"), "/" + key + "('", "')");
+          }
+
+          jsonObject.put("Office365Id", office365Id);
+          Office365Service.LOG.debug(
+              String.format(I18n.get(ITranslation.OFFICE365_OBJECT_SYNC_SUCESS), type, jsonObject));
+        } else {
+          Office365Service.LOG.debug(
+              String.format(
+                  I18n.get(ITranslation.OFFICE365_OBJECT_SYNC_FAILURE),
+                  type,
+                  jsonObject,
+                  response.code(),
+                  response.message(),
+                  response.body().string()));
         }
       }
     } catch (Exception e) {
@@ -178,6 +200,40 @@ public class Office365ServiceImpl implements Office365Service {
     }
 
     return office365Id;
+  }
+
+  public void deleteOffice365Object(
+      String urlStr, String office365Id, String accessToken, String type) {
+
+    try {
+      if (office365Id != null) {
+        urlStr = urlStr + "/" + office365Id;
+      }
+      URL url = new URL(urlStr);
+
+      Request request =
+          new Request.Builder().url(url).addHeader("Authorization", accessToken).delete().build();
+      OkHttpClient httpClient = new OkHttpClient();
+      try (Response response = httpClient.newCall(request).execute()) {
+        if (!response.isSuccessful() && response.code() != 404) {
+          TraceBackService.trace(
+              new AxelorException(
+                  TraceBackRepository.CATEGORY_CONFIGURATION_ERROR,
+                  String.format(
+                      I18n.get(ITranslation.OFFICE365_OBJECT_REMOVAL_FAILURE),
+                      office365Id,
+                      response.code(),
+                      response.message(),
+                      response.body().string())));
+        } else {
+          Office365Service.LOG.debug(
+              String.format(
+                  I18n.get(ITranslation.OFFICE365_OBJECT_REMOVAL_SUCESS), type, office365Id));
+        }
+      }
+    } catch (Exception e) {
+      TraceBackService.trace(e);
+    }
   }
 
   public void putUserEmailAddress(User user, JSONObject jsonObject, String key)
@@ -209,6 +265,7 @@ public class Office365ServiceImpl implements Office365Service {
   }
 
   @Transactional
+  @Override
   public String getAccessTocken(OfficeAccount officeAccount) throws AxelorException {
 
     try {
@@ -231,6 +288,7 @@ public class Office365ServiceImpl implements Office365Service {
       officeAccount.setRefreshToken(accessToken.getRefreshToken());
       appOffice365Repo.save(appOffice365);
 
+      Office365Service.LOG.debug(I18n.get(ITranslation.OFFICE365_ACCESS_TOKEN_SUCESS));
       return accessToken.getTokenType() + " " + accessToken.getAccessToken();
     } catch (Exception e) {
       throw new AxelorException(
@@ -239,7 +297,8 @@ public class Office365ServiceImpl implements Office365Service {
   }
 
   @SuppressWarnings("unchecked")
-  private JSONArray fetchData(String urlStr, String accessToken, boolean isListResult) {
+  private JSONArray fetchData(
+      String urlStr, String accessToken, boolean isListResult, String type) {
 
     JSONArray jsonArray = new JSONArray();
     HTTPClient httpclient = new HTTPClient();
@@ -250,12 +309,17 @@ public class Office365ServiceImpl implements Office365Service {
     request.setHeaders(headers);
     request.setMethod(HTTPMethod.GET);
 
-    int top = 500;
-    int count = 0;
-    int skip = 0;
+    Integer top = 500;
+    Integer count = 0;
+    Integer skip = 0;
     do {
       try {
-        URL url = new URL(urlStr + "?top=" + top + "&count=true&skip=" + skip);
+        URIBuilder ub = new URIBuilder(urlStr);
+        ub.addParameter("top", top.toString());
+        ub.addParameter("skip", skip.toString());
+        ub.addParameter("$count", "true");
+
+        URL url = new URL(ub.toString());
         request.setUrl(url);
 
         HTTPResponse response = httpclient.execute(request);
@@ -275,6 +339,9 @@ public class Office365ServiceImpl implements Office365Service {
       count -= skip;
     } while (count > 0);
 
+    Office365Service.LOG.debug(
+        String.format(
+            I18n.get(ITranslation.OFFICE365_OBJECT_FETCH_SUCESS), type, jsonArray.size()));
     return jsonArray;
   }
 
@@ -285,30 +352,42 @@ public class Office365ServiceImpl implements Office365Service {
     LocalDateTime start = Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime();
     String accessToken = getAccessTocken(officeAccount);
 
-    JSONArray jsonArray = fetchData(Office365Service.CONTACT_URL, accessToken, true);
-    for (Object object : jsonArray) {
-      JSONObject jsonObject = (JSONObject) object;
-      contactService.createContact(jsonObject, officeAccount, officeAccount.getLastContactSyncOn());
+    JSONArray jsonArray = fetchData(Office365Service.CONTACT_URL, accessToken, true, "contacts");
+    if (jsonArray != null) {
+      List<Long> partnerIdList = new ArrayList<>();
+      for (Object object : jsonArray) {
+        JSONObject jsonObject = (JSONObject) object;
+        Partner partner =
+            contactService.createContact(
+                jsonObject, officeAccount, officeAccount.getLastContactSyncOn());
+        if (partner != null) {
+          if (!partnerIdList.contains(partner.getId())) {
+            partnerIdList.add(partner.getId());
+          }
+          if (partner.getMainPartner() != null
+              && !partnerIdList.contains(partner.getMainPartner().getId())) {
+            partnerIdList.add(partner.getMainPartner().getId());
+          }
+        }
+      }
+      contactService.removeContact(partnerIdList, officeAccount);
     }
 
-    String queryStr =
-        query
-            + " AND (self.officeAccount = :officeAccount OR self.user.officeAccount = :officeAccount)";
+    String queryStr = query;
     QueryBuilder<Partner> partnerQuery = QueryBuilder.of(Partner.class);
     if (officeAccount.getLastContactSyncOn() != null) {
-      queryStr =
-          lastSyncQuery
-              + " AND (self.officeAccount = :officeAccount OR self.user.officeAccount = :officeAccount)";
+      queryStr = lastSyncQuery;
       partnerQuery = partnerQuery.bind("lastSync", officeAccount.getLastContactSyncOn());
     }
     List<Partner> partnerList =
         partnerQuery
             .add(queryStr)
+            .add(
+                "(self.officeAccount = :officeAccount OR self.user.officeAccount = :officeAccount)")
             .bind("start", start)
             .bind("officeAccount", officeAccount)
             .build()
             .fetch();
-
     if (ObjectUtils.notEmpty(partnerList)) {
       for (Partner partner : partnerList) {
         contactService.createOffice365Contact(partner, officeAccount, accessToken);
@@ -318,6 +397,7 @@ public class Office365ServiceImpl implements Office365Service {
     officeAccount.setLastContactSyncOn(
         Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime());
     officeAccountRepo.save(officeAccount);
+    Office365Service.LOG.debug(I18n.get(ITranslation.OFFICE365_CONTACT_SYNC));
   }
 
   @Transactional
@@ -326,48 +406,79 @@ public class Office365ServiceImpl implements Office365Service {
 
     LocalDateTime start = Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime();
     String accessToken = getAccessTocken(officeAccount);
-    QueryBuilder<ICalendar> calendarQuery = QueryBuilder.of(ICalendar.class);
-    List<ICalendarEvent> eventList = getICalendarEventList(calendarQuery, start, officeAccount);
-    ICalendar defaultCalendar =
-        calendarService.manageDefaultCalendar(eventList, officeAccount, accessToken);
+    List<Long> removedEventIdList = new ArrayList<>();
 
-    JSONArray calendarArray = fetchData(Office365Service.CALENDAR_URL, accessToken, true);
+    JSONArray calendarArray =
+        fetchData(Office365Service.CALENDAR_URL, accessToken, true, "calendars");
     if (calendarArray != null) {
+      List<Long> calendarIdList = new ArrayList<>();
       for (Object object : calendarArray) {
         JSONObject jsonObject = (JSONObject) object;
         ICalendar iCalendar =
             calendarService.createCalendar(
                 jsonObject, officeAccount, officeAccount.getLastCalendarSyncOn());
+        if (iCalendar != null && !calendarIdList.contains(iCalendar.getId())) {
+          calendarIdList.add(iCalendar.getId());
+        }
+
         syncEvent(
             iCalendar,
             officeAccount,
             accessToken,
-            defaultCalendar,
             officeAccount.getLastCalendarSyncOn(),
-            start);
+            start,
+            removedEventIdList);
         iCalendar.setLastSynchronizationDateT(
             Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime());
         iCalendarRepo.save(iCalendar);
       }
+      calendarService.removeCalendar(calendarIdList, officeAccount);
     }
 
-    User currentUser = Beans.get(UserService.class).getUser();
+    QueryBuilder<ICalendar> calendarQuery =
+        QueryBuilder.of(ICalendar.class)
+            .add("self.typeSelect = :typeSelect")
+            .add(
+                "(self.officeAccount = :officeAccount OR self.user.officeAccount = :officeAccount)")
+            .add("COALESCE(self.isOfficeDefaultCalendar, false) = false")
+            .add("COALESCE(self.archived, false) = false")
+            .bind("typeSelect", ICalendarRepository.OFFICE_365)
+            .bind("start", start)
+            .bind("officeAccount", officeAccount);
+    if (officeAccount.getLastCalendarSyncOn() != null) {
+      calendarQuery =
+          calendarQuery.add(lastSyncQuery).bind("lastSync", officeAccount.getLastCalendarSyncOn());
+    } else {
+      calendarQuery = calendarQuery.add(query);
+    }
     List<ICalendar> calendarList = calendarQuery.build().fetch();
     if (ObjectUtils.notEmpty(calendarList)) {
       for (ICalendar calendar : calendarList) {
         calendarService.createOffice365Calendar(calendar, officeAccount, accessToken);
       }
     }
-    if (ObjectUtils.notEmpty(eventList)) {
-      for (ICalendarEvent event : eventList) {
-        calendarService.createOffice365Event(
-            event, officeAccount, accessToken, currentUser, defaultCalendar, start);
-      }
+
+    List<ICalendar> allCalendar =
+        Beans.get(ICalendarRepository.class)
+            .all()
+            .filter(
+                "(self.officeAccount = :officeAccount OR self.user.officeAccount = :officeAccount) "
+                    + " AND self.typeSelect = :typeSelect AND self.createdOn < :start "
+                    + " AND COALESCE(self.isOfficeEditableCalendar, true) = true")
+            .bind("typeSelect", ICalendarRepository.OFFICE_365)
+            .bind("officeAccount", officeAccount)
+            .bind("start", start)
+            .fetch();
+    User currentUser = Beans.get(UserService.class).getUser();
+    for (ICalendar iCalendar : allCalendar) {
+      syncOffice365Event(
+          iCalendar, officeAccount, currentUser, accessToken, start, removedEventIdList);
     }
 
     officeAccount.setLastCalendarSyncOn(
         Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime());
     officeAccountRepo.save(officeAccount);
+    Office365Service.LOG.debug(I18n.get(ITranslation.OFFICE365_CALENDAR_SYNC));
   }
 
   @Transactional
@@ -382,10 +493,14 @@ public class Office365ServiceImpl implements Office365Service {
     LocalDateTime start = Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime();
     String accessToken = getAccessTocken(calendar.getOfficeAccount());
 
+    List<Long> removedEventIdList = new ArrayList<>();
     if (StringUtils.isNoneBlank(calendar.getOffice365Id())) {
       JSONArray calendarArray =
           fetchData(
-              Office365Service.CALENDAR_URL + "/" + calendar.getOffice365Id(), accessToken, false);
+              Office365Service.CALENDAR_URL + "/" + calendar.getOffice365Id(),
+              accessToken,
+              false,
+              "calendars");
       if (calendarArray != null) {
         JSONObject calendarJsonObj = (JSONObject) calendarArray.get(0);
         calendar =
@@ -395,22 +510,16 @@ public class Office365ServiceImpl implements Office365Service {
             calendar,
             officeAccount,
             accessToken,
-            null,
             officeAccount.getLastCalendarSyncOn(),
-            start);
+            start,
+            removedEventIdList);
       }
     }
 
     calendarService.createOffice365Calendar(calendar, officeAccount, accessToken);
     User currentUser = Beans.get(UserService.class).getUser();
-    List<ICalendarEvent> eventList =
-        calendarService.getICalendarEvents(calendar, officeAccount.getLastCalendarSyncOn(), start);
-    if (ObjectUtils.notEmpty(eventList)) {
-      for (ICalendarEvent event : eventList) {
-        calendarService.createOffice365Event(
-            event, officeAccount, accessToken, currentUser, null, start);
-      }
-    }
+    syncOffice365Event(
+        calendar, officeAccount, currentUser, accessToken, start, removedEventIdList);
 
     LocalDateTime lastSync = Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime();
     calendar.setLastSynchronizationDateT(lastSync);
@@ -418,60 +527,66 @@ public class Office365ServiceImpl implements Office365Service {
 
     officeAccount.setLastCalendarSyncOn(lastSync);
     officeAccountRepo.save(officeAccount);
-  }
-
-  private List<ICalendarEvent> getICalendarEventList(
-      QueryBuilder<ICalendar> calendarQuery, LocalDateTime start, OfficeAccount officeAccount) {
-
-    LocalDateTime lastSyncOn = officeAccount.getLastCalendarSyncOn();
-    calendarQuery =
-        calendarQuery
-            .add("self.typeSelect = :typeSelect")
-            .add(
-                "(self.officeAccount = :officeAccount OR self.user.officeAccount = :officeAccount)")
-            .bind("typeSelect", ICalendarRepository.OFFICE_365)
-            .bind("start", start)
-            .bind("officeAccount", officeAccount);
-    QueryBuilder<ICalendarEvent> eventQuery =
-        QueryBuilder.of(ICalendarEvent.class)
-            .add("(self.office365Id IS NULL OR COALESCE(self.calendar.keepRemote, false) = false)")
-            .add(
-                "(self.calendar.officeAccount = :officeAccount "
-                    + "OR self.calendar.user.officeAccount = :officeAccount "
-                    + "OR self.user.officeAccount = :officeAccount)");
-    if (lastSyncOn != null) {
-      calendarQuery = calendarQuery.add(lastSyncQuery).bind("lastSync", lastSyncOn);
-      eventQuery = eventQuery.add(lastSyncQuery).bind("lastSync", lastSyncOn);
-    } else {
-      calendarQuery = calendarQuery.add(query);
-      eventQuery = eventQuery.add(query);
-    }
-
-    return eventQuery.bind("start", start).bind("officeAccount", officeAccount).build().fetch();
+    Office365Service.LOG.debug(I18n.get(ITranslation.OFFICE365_CALENDAR_SYNC));
   }
 
   private void syncEvent(
       ICalendar iCalendar,
       OfficeAccount officeAccount,
       String accessToken,
-      ICalendar defaultCalendar,
       LocalDateTime lastSyncOn,
-      LocalDateTime now)
+      LocalDateTime now,
+      List<Long> removedEventIdList)
       throws MalformedURLException {
 
     if (iCalendar == null || StringUtils.isBlank(iCalendar.getOffice365Id())) {
       return;
     }
 
-    String calendarId = calendarService.getCalendarOffice365Id(iCalendar, defaultCalendar);
-    String eventUrl = String.format(Office365Service.EVENT_URL, calendarId);
-
-    JSONArray eventArray = fetchData(eventUrl, accessToken, true);
+    String eventUrl = String.format(Office365Service.EVENT_URL, iCalendar.getOffice365Id());
+    JSONArray eventArray = fetchData(eventUrl, accessToken, true, "events");
     if (eventArray != null) {
+      List<Long> syncEventIdList = new ArrayList<>();
       for (Object object : eventArray) {
         JSONObject jsonObject = (JSONObject) object;
-        calendarService.createEvent(
-            jsonObject, officeAccount, iCalendar, defaultCalendar, lastSyncOn, now);
+        ICalendarEvent event =
+            calendarService.createEvent(jsonObject, officeAccount, iCalendar, lastSyncOn, now);
+        if (event != null && !syncEventIdList.contains(event.getId())) {
+          syncEventIdList.add(event.getId());
+        }
+      }
+
+      String filter = "self.calendar = :calendar AND self.office365Id IS NOT NULL";
+      Map<String, Object> bindingMap = new HashMap<>();
+      bindingMap.put("calendar", iCalendar);
+      if (ObjectUtils.notEmpty(syncEventIdList)) {
+        bindingMap.put("ids", syncEventIdList);
+        filter += " AND self.id NOT IN :ids";
+      }
+      if (iCalendar.getSynchronizationSelect() != null
+          && ICalendarRepository.CRM_SYNCHRO.equals(iCalendar.getSynchronizationSelect())) {
+        filter += " AND self.parentEvent IS NULL";
+      }
+      List<ICalendarEvent> removalEventList =
+          calendarService.getEventList(iCalendar.getSynchronizationSelect(), filter, bindingMap);
+      calendarService.removeEvent(removalEventList, iCalendar, now, removedEventIdList);
+    }
+  }
+
+  private void syncOffice365Event(
+      ICalendar calendar,
+      OfficeAccount officeAccount,
+      User currentUser,
+      String accessToken,
+      LocalDateTime start,
+      List<Long> removedEventIdList) {
+
+    List<ICalendarEvent> eventList =
+        calendarService.getICalendarEvents(
+            calendar, officeAccount.getLastCalendarSyncOn(), start, removedEventIdList);
+    if (ObjectUtils.notEmpty(eventList)) {
+      for (ICalendarEvent event : eventList) {
+        calendarService.createOffice365Event(event, officeAccount, accessToken, currentUser, start);
       }
     }
   }
@@ -482,27 +597,31 @@ public class Office365ServiceImpl implements Office365Service {
 
     LocalDateTime start = Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime();
     String accessToken = getAccessTocken(officeAccount);
-    JSONArray messageArray = fetchData(urlStr, accessToken, true);
+    JSONArray messageArray = fetchData(urlStr, accessToken, true, "mails");
     if (messageArray != null) {
+      List<Long> messageIdList = new ArrayList<>();
       for (Object object : messageArray) {
         JSONObject jsonObject = (JSONObject) object;
-        mailService.createMessage(jsonObject, officeAccount, officeAccount.getLastMailSyncOn());
+        Message message =
+            mailService.createMessage(jsonObject, officeAccount, officeAccount.getLastMailSyncOn());
+        if (message != null && !messageIdList.contains(message.getId())) {
+          messageIdList.add(message.getId());
+        }
       }
+      mailService.removeMessage(messageIdList, officeAccount);
     }
 
-    String queryStr =
-        query
-            + " AND (self.officeAccount = :officeAccount OR self.senderUser.officeAccount = :officeAccount)";
+    String queryStr = query;
     QueryBuilder<Message> messageQuery = QueryBuilder.of(Message.class);
     if (officeAccount.getLastMailSyncOn() != null) {
-      queryStr =
-          lastSyncQuery
-              + " AND (self.officeAccount = :officeAccount OR self.senderUser.officeAccount = :officeAccount)";
+      queryStr = lastSyncQuery;
       messageQuery = messageQuery.bind("lastSync", officeAccount.getLastMailSyncOn());
     }
     List<Message> messageList =
         messageQuery
             .add(queryStr)
+            .add(
+                "(self.officeAccount = :officeAccount OR self.senderUser.officeAccount = :officeAccount)")
             .bind("start", start)
             .bind("officeAccount", officeAccount)
             .build()
@@ -517,6 +636,7 @@ public class Office365ServiceImpl implements Office365Service {
     officeAccount.setLastMailSyncOn(
         Beans.get(AppBaseService.class).getTodayDateTime().toLocalDateTime());
     officeAccountRepo.save(officeAccount);
+    Office365Service.LOG.debug(I18n.get(ITranslation.OFFICE365_MAIL_SYNC));
   }
 
   public User getUser(String name, String email) {
@@ -580,7 +700,7 @@ public class Office365ServiceImpl implements Office365Service {
     }
 
     String accessToken = getAccessTocken(officeAccount);
-    JSONArray jsonArr = fetchData(urlStr, accessToken, false);
+    JSONArray jsonArr = fetchData(urlStr, accessToken, false, "user");
     if (jsonArr.isEmpty()) {
       return;
     }

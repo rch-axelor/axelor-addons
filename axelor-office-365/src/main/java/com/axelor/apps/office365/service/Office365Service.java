@@ -22,15 +22,20 @@ import com.axelor.apps.message.db.EmailAddress;
 import com.axelor.apps.office.db.OfficeAccount;
 import com.axelor.auth.db.User;
 import com.axelor.exception.AxelorException;
+import java.lang.invoke.MethodHandles;
 import java.net.MalformedURLException;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import wslite.json.JSONException;
 import wslite.json.JSONObject;
 
 public interface Office365Service {
+
+  static final Logger LOG = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
   static final String SCOPE =
       "openid offline_access Contacts.ReadWrite Calendars.ReadWrite Mail.ReadWrite";
@@ -41,6 +46,7 @@ public interface Office365Service {
   static final String CONTACT_URL = GRAPH_URL + "me/contacts";
   static final String CALENDAR_URL = GRAPH_URL + "me/calendars";
   static final String EVENT_URL = GRAPH_URL + "me/calendars/%s/events";
+  static final String DELETE_EVENT_URL = GRAPH_URL + "me/events";
   static final String MAIL_URL = GRAPH_URL + "me/messages";
   static final String MAIL_USER_URL = GRAPH_URL + "users/%s/messages";
   static final String MAIL_ID_URL = GRAPH_URL + "users/%s/messages/%s";
@@ -60,7 +66,16 @@ public interface Office365Service {
       LocalDateTime updatedOn);
 
   String createOffice365Object(
-      String urlStr, JSONObject jsonObject, String accessToken, String office365Id, String key);
+      String urlStr,
+      JSONObject jsonObject,
+      String accessToken,
+      String office365Id,
+      String key,
+      String type);
+
+  void deleteOffice365Object(String urlStr, String office365Id, String accessToken, String type);
+
+  String getAccessTocken(OfficeAccount officeAccount) throws AxelorException;
 
   void putUserEmailAddress(User user, JSONObject jsonObject, String key) throws JSONException;
 

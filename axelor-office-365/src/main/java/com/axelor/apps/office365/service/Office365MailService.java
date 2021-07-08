@@ -26,17 +26,20 @@ import com.axelor.apps.message.db.repo.EmailAccountRepository;
 import com.axelor.apps.message.db.repo.EmailAddressRepository;
 import com.axelor.apps.message.db.repo.MessageRepository;
 import com.axelor.apps.office.db.OfficeAccount;
+import com.axelor.apps.office365.translation.ITranslation;
 import com.axelor.auth.db.User;
 import com.axelor.auth.db.repo.UserRepository;
 import com.axelor.common.ObjectUtils;
 import com.axelor.common.StringUtils;
 import com.axelor.exception.service.TraceBackService;
+import com.axelor.i18n.I18n;
 import com.google.inject.Inject;
 import com.google.inject.persist.Transactional;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import wslite.json.JSONArray;
 import wslite.json.JSONException;
@@ -53,11 +56,11 @@ public class Office365MailService {
   @Inject private Office365Service office365Service;
 
   @Transactional
-  public void createMessage(
+  public Message createMessage(
       JSONObject jsonObject, OfficeAccount officeAccount, LocalDateTime lastSyncOn) {
 
     if (jsonObject == null) {
-      return;
+      return null;
     }
 
     try {
@@ -70,7 +73,7 @@ public class Office365MailService {
 
       } else if (!office365Service.needUpdation(
           jsonObject, lastSyncOn, message.getCreatedOn(), message.getUpdatedOn())) {
-        return;
+        return message;
       }
 
       message.setSubject(office365Service.processJsonValue("subject", jsonObject));
@@ -110,8 +113,13 @@ public class Office365MailService {
       setSender(jsonObject, message, officeAccount.getOwnerUser());
 
       messageRepo.save(message);
+      Office365Service.LOG.debug(
+          String.format(
+              I18n.get(ITranslation.OFFICE365_OBJECT_SYNC_SUCESS), "mail", message.toString()));
+      return message;
     } catch (Exception e) {
       TraceBackService.trace(e);
+      return null;
     }
   }
 
@@ -127,7 +135,8 @@ public class Office365MailService {
               messageJsonObject,
               accessToken,
               message.getOffice365Id(),
-              "messages");
+              "messages",
+              "mail");
 
       message.setOffice365Id(office365Id);
       message.setOfficeAccount(officeAccount);
@@ -135,6 +144,23 @@ public class Office365MailService {
 
     } catch (Exception e) {
       TraceBackService.trace(e);
+    }
+  }
+
+  @Transactional
+  public void removeMessage(List<Long> messageIdList, OfficeAccount officeAccount) {
+
+    try {
+      if (ObjectUtils.notEmpty(messageIdList)) {
+        messageRepo
+            .all()
+            .filter(
+                "self.id NOT IN :ids AND self.office365Id IS NOT NULL AND self.officeAccount = :officeAccount")
+            .bind("ids", messageIdList)
+            .bind("officeAccount", officeAccount)
+            .delete();
+      }
+    } catch (Exception e) {
     }
   }
 
@@ -238,9 +264,14 @@ public class Office365MailService {
     JSONObject senderJsonObj = this.getJSONObject(jsonObject, "sender");
     if (senderJsonObj == null) {
       message.setSenderUser(ownerUser);
+      return;
     }
 
     JSONObject emailAddressJsonObj = senderJsonObj.getJSONObject("emailAddress");
+    if (emailAddressJsonObj == null) {
+      return;
+    }
+
     String email = emailAddressJsonObj.getString("address");
     String name = emailAddressJsonObj.getString("name");
 
@@ -251,7 +282,8 @@ public class Office365MailService {
       Partner partner =
           partnerRepository
               .all()
-              .filter("self.emailAddress = :emailAddress")
+              .filter(
+                  "self.emailAddress = :emailAddress AND self NOT IN (SELECT partner FROM User)")
               .bind("emailAddress", emailAddress)
               .fetchOne();
       user.setPartner(partner);
