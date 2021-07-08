@@ -66,8 +66,8 @@ import wslite.json.JSONObject;
 
 public class Office365CalendarService {
 
-  private static final int DEAFULT_SYNC_DURATION = 10;
-  private static final int DEAFULT_RECURRENCE_YEARS = 20;
+  static final int DEAFULT_SYNC_DURATION = 10;
+  static final int DEAFULT_RECURRENCE_YEARS = 20;
 
   @Inject private Office365Service office365Service;
   @Inject private EventService eventService;
@@ -236,15 +236,8 @@ public class Office365CalendarService {
         return event;
       }
 
-      setEventValues(
+      return setEventValues(
           jsonObject, event, iCalendar, officeAccount.getOwnerUser(), eventStart, eventEnd, now);
-
-      eventRepo.save(event);
-      Office365Service.LOG.debug(
-          String.format(
-              I18n.get(ITranslation.OFFICE365_OBJECT_SYNC_SUCESS), "event", event.toString()));
-
-      return event;
     } catch (Exception e) {
       TraceBackService.trace(e);
       return null;
@@ -414,7 +407,7 @@ public class Office365CalendarService {
   }
 
   @SuppressWarnings("unchecked")
-  private void setEventValues(
+  private ICalendarEvent setEventValues(
       JSONObject jsonObject,
       ICalendarEvent event,
       ICalendar iCalendar,
@@ -423,6 +416,11 @@ public class Office365CalendarService {
       LocalDateTime eventEnd,
       LocalDateTime now)
       throws JSONException {
+
+    String subject = jsonObject.getOrDefault("subject", "").toString();
+    if (StringUtils.isBlank(subject)) {
+      return null;
+    }
 
     event.setSubject(jsonObject.getOrDefault("subject", "").toString());
     event.setAllDay((Boolean) jsonObject.getOrDefault("isAllDay", false));
@@ -453,6 +451,12 @@ public class Office365CalendarService {
       manageRecurrenceConfigration(crmEvent, jsonObject);
       manageEventCategory(crmEvent, jsonObject);
     }
+
+    eventRepo.save(event);
+    Office365Service.LOG.debug(
+        String.format(
+            I18n.get(ITranslation.OFFICE365_OBJECT_SYNC_SUCESS), "event", event.toString()));
+    return event;
   }
 
   @SuppressWarnings("unchecked")

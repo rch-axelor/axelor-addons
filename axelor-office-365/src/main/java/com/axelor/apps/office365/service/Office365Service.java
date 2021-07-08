@@ -46,6 +46,7 @@ public interface Office365Service {
   static final String CONTACT_URL = GRAPH_URL + "me/contacts";
   static final String CALENDAR_URL = GRAPH_URL + "me/calendars";
   static final String EVENT_URL = GRAPH_URL + "me/calendars/%s/events";
+  static final String CALENDAR_VIEW_URL = GRAPH_URL + "me/calendars/%s/calendarView";
   static final String DELETE_EVENT_URL = GRAPH_URL + "me/events";
   static final String MAIL_URL = GRAPH_URL + "me/messages";
   static final String MAIL_USER_URL = GRAPH_URL + "users/%s/messages";

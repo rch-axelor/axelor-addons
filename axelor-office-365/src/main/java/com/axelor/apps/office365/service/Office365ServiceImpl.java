@@ -84,6 +84,7 @@ public class Office365ServiceImpl implements Office365Service {
   private static String query = "(self.office365Id IS NULL AND self.createdOn < :start)";
   private static String lastSyncQuery =
       "(self.office365Id IS NULL OR (COALESCE(self.updatedOn, self.createdOn) BETWEEN :lastSync AND :start))";
+  private String deltaToken = null;
 
   @Override
   @SuppressWarnings("unchecked")
@@ -312,36 +313,102 @@ public class Office365ServiceImpl implements Office365Service {
     Integer top = 500;
     Integer count = 0;
     Integer skip = 0;
-    do {
-      try {
-        URIBuilder ub = new URIBuilder(urlStr);
-        ub.addParameter("top", top.toString());
-        ub.addParameter("skip", skip.toString());
-        ub.addParameter("$count", "true");
+    try {
+      URIBuilder ub = new URIBuilder(urlStr);
+      ub.addParameter("$count", "true");
+      do {
+        try {
+          ub.addParameter("top", top.toString());
+          ub.addParameter("skip", skip.toString());
 
-        URL url = new URL(ub.toString());
-        request.setUrl(url);
+          URL url = new URL(ub.toString());
+          request.setUrl(url);
 
-        HTTPResponse response = httpclient.execute(request);
-        if (response.getStatusCode() == 200) {
-          JSONObject jsonObject = new JSONObject(response.getContentAsString());
-          if (isListResult) {
-            count = (int) jsonObject.getOrDefault("@odata.count", 0);
-            jsonArray.addAll((JSONArray) jsonObject.getOrDefault("value", new JSONArray()));
-          } else {
-            jsonArray.add(jsonObject);
+          HTTPResponse response = httpclient.execute(request);
+          if (response.getStatusCode() == 200) {
+            JSONObject jsonObject = new JSONObject(response.getContentAsString());
+            if (isListResult) {
+              count = (int) jsonObject.getOrDefault("@odata.count", 0);
+              jsonArray.addAll((JSONArray) jsonObject.getOrDefault("value", new JSONArray()));
+            } else {
+              jsonArray.add(jsonObject);
+            }
           }
+        } catch (Exception e) {
+          TraceBackService.trace(e);
         }
-      } catch (Exception e) {
-        TraceBackService.trace(e);
-      }
-      skip += top;
-      count -= skip;
-    } while (count > 0);
+        skip += top;
+        count -= skip;
+      } while (count > 0);
+    } catch (Exception e) {
+      TraceBackService.trace(e);
+    }
 
     Office365Service.LOG.debug(
         String.format(
             I18n.get(ITranslation.OFFICE365_OBJECT_FETCH_SUCESS), type, jsonArray.size()));
+    return jsonArray;
+  }
+
+  @SuppressWarnings("unchecked")
+  private JSONArray fetchIncrementalData(
+      String urlStr,
+      String accessToken,
+      String type,
+      LocalDateTime startDate,
+      LocalDateTime endDate,
+      String deltaTocken) {
+
+    JSONArray jsonArray = new JSONArray();
+    HTTPClient httpclient = new HTTPClient();
+    HTTPRequest request = new HTTPRequest();
+    Map<String, Object> headers = new HashMap<>();
+    headers.put("Accept", "application/json");
+    headers.put("Authorization", accessToken);
+    request.setHeaders(headers);
+    request.setMethod(HTTPMethod.GET);
+
+    try {
+      urlStr += "/delta";
+      URIBuilder ub = new URIBuilder(urlStr);
+      if (StringUtils.isBlank(deltaTocken) && startDate != null && endDate != null) {
+        ub.addParameter("startdatetime", startDate.toString());
+        ub.addParameter("enddatetime", endDate.toString());
+      } else {
+        ub.addParameter("$deltatoken", deltaTocken);
+      }
+
+      String skipToken = null;
+      do {
+        try {
+          URL url = new URL(ub.toString());
+          request.setUrl(url);
+          HTTPResponse response = httpclient.execute(request);
+
+          if (response.getStatusCode() == 200) {
+            JSONObject jsonObject = new JSONObject(response.getContentAsString());
+            jsonArray.addAll((JSONArray) jsonObject.getOrDefault("value", new JSONArray()));
+
+            String nextLink = (String) jsonObject.getOrDefault("@odata.nextLink", null);
+            String deltaLink = (String) jsonObject.getOrDefault("@odata.deltaLink", null);
+            if (StringUtils.isNotBlank(nextLink)) {
+              skipToken = StringUtils.substringAfterLast(nextLink, "$skiptoken=");
+              ub = new URIBuilder(urlStr);
+              ub.addParameter("$skiptoken", skipToken);
+            }
+            if (StringUtils.isNoneBlank(deltaLink)) {
+              this.deltaToken = StringUtils.substringAfterLast(deltaLink, "$deltatoken=");
+              skipToken = null;
+            }
+          }
+        } catch (Exception e) {
+          TraceBackService.trace(e);
+        }
+      } while (StringUtils.isNotBlank(skipToken));
+    } catch (Exception e) {
+      TraceBackService.trace(e);
+    }
+
     return jsonArray;
   }
 
@@ -539,13 +606,32 @@ public class Office365ServiceImpl implements Office365Service {
       List<Long> removedEventIdList)
       throws MalformedURLException {
 
-    if (iCalendar == null || StringUtils.isBlank(iCalendar.getOffice365Id())) {
+    if (iCalendar == null
+        || StringUtils.isBlank(iCalendar.getOffice365Id())
+        || (!iCalendar.getIsOfficeEditableCalendar()
+            && StringUtils.isNoneBlank(iCalendar.getCalendarViewDeltatoken()))) {
       return;
     }
 
-    String eventUrl = String.format(Office365Service.EVENT_URL, iCalendar.getOffice365Id());
-    JSONArray eventArray = fetchData(eventUrl, accessToken, true, "events");
+    LocalDateTime startDate = null, endDate = null;
+    String deltaToken = iCalendar.getCalendarViewDeltatoken();
+    if (StringUtils.isBlank(deltaToken)) {
+      if (iCalendar.getSynchronizationDuration() > 0) {
+        startDate = now.minusWeeks(iCalendar.getSynchronizationDuration());
+        endDate = now.plusWeeks(iCalendar.getSynchronizationDuration());
+      } else {
+        startDate = now.minusWeeks(Office365CalendarService.DEAFULT_SYNC_DURATION);
+        endDate = now.plusWeeks(Office365CalendarService.DEAFULT_SYNC_DURATION);
+      }
+    }
+    String eventUrl = String.format(Office365Service.CALENDAR_VIEW_URL, iCalendar.getOffice365Id());
+    JSONArray eventArray =
+        fetchIncrementalData(eventUrl, accessToken, "events", startDate, endDate, deltaToken);
+
     if (eventArray != null) {
+      if (StringUtils.isNotBlank(this.deltaToken)) {
+        iCalendar.setCalendarViewDeltatoken(this.deltaToken);
+      }
       List<Long> syncEventIdList = new ArrayList<>();
       for (Object object : eventArray) {
         JSONObject jsonObject = (JSONObject) object;
@@ -556,7 +642,7 @@ public class Office365ServiceImpl implements Office365Service {
         }
       }
 
-      String filter = "self.calendar = :calendar AND self.office365Id IS NOT NULL";
+      /*String filter = "self.calendar = :calendar AND self.office365Id IS NOT NULL";
       Map<String, Object> bindingMap = new HashMap<>();
       bindingMap.put("calendar", iCalendar);
       if (ObjectUtils.notEmpty(syncEventIdList)) {
@@ -569,7 +655,7 @@ public class Office365ServiceImpl implements Office365Service {
       }
       List<ICalendarEvent> removalEventList =
           calendarService.getEventList(iCalendar.getSynchronizationSelect(), filter, bindingMap);
-      calendarService.removeEvent(removalEventList, iCalendar, now, removedEventIdList);
+      calendarService.removeEvent(removalEventList, iCalendar, now, removedEventIdList);*/
     }
   }
 
